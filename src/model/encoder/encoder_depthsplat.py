@@ -206,13 +206,6 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
                 "depths": depths
             }
 
-        # features [BV, C, H, W]
-        features = self.feature_upsampler(results_dict["features_mono_intermediate"],
-                                          cnn_features=results_dict["features_cnn_all_scales"][::-1],
-                                          mv_features=results_dict["features_mv"][
-                                          0] if self.cfg.num_scales == 1 else results_dict["features_mv"][::-1]
-                                          )
-
         # match prob from softmax
         # [BV, D, H, W] in feature resolution
         match_prob = results_dict['match_probs'][-1]
@@ -221,24 +214,27 @@ class EncoderDepthSplat(Encoder[EncoderDepthSplatCfg]):
         match_prob = F.interpolate(
             match_prob, size=depth.shape[-2:], mode='nearest')
 
-        # unet input
+        features = self.feature_upsampler(
+            results_dict["features_mono_intermediate"],
+            cnn_features=results_dict["features_cnn_all_scales"][::-1],
+            mv_features=(
+                results_dict["features_mv"][0]
+                if self.cfg.num_scales == 1
+                else results_dict["features_mv"][::-1]
+            ),
+        )
         concat = torch.cat((
             rearrange(context["image"], "b v c h w -> (b v) c h w"),
             rearrange(depth, "b v h w -> (b v) () h w"),
             match_prob,
             features,
         ), dim=1)
-
         out = self.gaussian_regressor(concat)
-
         concat = [out,
-                    rearrange(context["image"],
-                            "b v c h w -> (b v) c h w"),
-                    features,
-                    match_prob]
-
+                  rearrange(context["image"], "b v c h w -> (b v) c h w"),
+                  features,
+                  match_prob]
         out = torch.cat(concat, dim=1)
-
         gaussians = self.gaussian_head(out)  # [BV, C, H, W]
 
         gaussians = rearrange(gaussians, "(b v) c h w -> b v c h w", b=b, v=v)

@@ -14,7 +14,8 @@ from torch import Tensor, nn, optim
 import numpy as np
 import json
 import os
-import time
+import time  # [ADDED] for per-step timing
+import gc  # [ADDED] for explicit garbage collection to free cyclic autograd refs
 from tqdm import tqdm
 import torch.nn.functional as F
 import math
@@ -154,6 +155,12 @@ class ModelWrapper(LightningModule):
             self.time_skip_steps_dict = {"encoder": 0, "decoder": 0}
 
     def training_step(self, batch, batch_idx):
+        # [ADDED] Free prev-step backward cyclic autograd refs before forward starts.
+        gc.collect()
+        torch.cuda.empty_cache()
+        step_start = time.time()                        # [ADDED] per-step wall-clock timer
+        mem_start = torch.cuda.memory_allocated() / 1e9  # [ADDED] steady-state before forward
+        torch.cuda.reset_peak_memory_stats()            # [ADDED] reset so peak is per-step
         batch: BatchedExample = self.data_shim(batch)
         _, _, _, h, w = batch["target"]["image"].shape
 
@@ -231,7 +238,7 @@ class ModelWrapper(LightningModule):
             rearrange(target_gt, "b v c h w -> (b v) c h w"),
             rearrange(output.color, "b v c h w -> (b v) c h w"),
         )
-        self.log("train/psnr", psnr_probabilistic.mean())
+        self.log("train/psnr", psnr_probabilistic.mean(), on_epoch=False)  # [ADDED] on_epoch=False: val_check_interval=null이면 epoch이 안 끝나 PL이 step값을 무한 축적함
 
         # Compute and log loss.
         total_loss = 0
@@ -257,7 +264,7 @@ class ModelWrapper(LightningModule):
                     self.global_step,
                     valid_depth_mask=valid_depth_mask,
                 )
-            self.log(f"loss/{loss_fn.name}", loss)
+            self.log(f"loss/{loss_fn.name}", loss, on_epoch=False)
             total_loss = total_loss + loss
 
         # color loss on intermediate output
@@ -305,7 +312,7 @@ class ModelWrapper(LightningModule):
 
                         intermediate_loss = intermediate_loss + curr_loss_weight * loss
 
-                    self.log(f"loss/{loss_fn.name}_intermediate", intermediate_loss)
+                    self.log(f"loss/{loss_fn.name}_intermediate", intermediate_loss, on_epoch=False)
                     total_loss = total_loss + intermediate_loss
                 else:
                     if loss_fn.name == "mse":
@@ -326,28 +333,33 @@ class ModelWrapper(LightningModule):
                             self.global_step,
                             valid_depth_mask=valid_depth_mask,
                         )
-                    self.log(f"loss/{loss_fn.name}_intermediate", loss)
+                    self.log(f"loss/{loss_fn.name}_intermediate", loss, on_epoch=False)
                     total_loss = (
                         total_loss + self.train_cfg.intermediate_loss_weight * loss
                     )
 
-        self.log("loss/total", total_loss)
+        self.log("loss/total", total_loss, on_epoch=False)
 
+        # [ADDED] print memory/time every N steps (set by train.print_log_every_n_steps)
         if (
             self.global_rank == 0
             and self.global_step % self.train_cfg.print_log_every_n_steps == 0
         ):
+            mem_gb = torch.cuda.max_memory_allocated() / 1e9
+            step_sec = time.time() - step_start
+            n_ctx = batch['context']['index'].shape[1]
             print(
                 f"train step {self.global_step}; "
                 f"scene = {[x[:20] for x in batch['scene']]}; "
-                f"context = {batch['context']['index'].tolist()}; "
-                f"bound = [{batch['context']['near'].detach().cpu().numpy().mean()} "
-                f"{batch['context']['far'].detach().cpu().numpy().mean()}]; "
-                f"loss = {total_loss:.6f}"
+                f"context = {n_ctx} views; "
+                f"loss = {total_loss:.6f}; "
+                f"base = {mem_start:.2f} GB; "  # [ADDED] steady-state before forward
+                f"peak = {mem_gb:.2f} GB; "     # [ADDED] renamed for clarity
+                f"time = {step_sec:.2f}s"
             )
-        self.log("info/near", batch["context"]["near"].detach().cpu().numpy().mean())
-        self.log("info/far", batch["context"]["far"].detach().cpu().numpy().mean())
-        self.log("info/global_step", self.global_step)  # hack for ckpt monitor
+        self.log("info/near", batch["context"]["near"].detach().cpu().numpy().mean(), on_epoch=False)
+        self.log("info/far", batch["context"]["far"].detach().cpu().numpy().mean(), on_epoch=False)
+        self.log("info/global_step", self.global_step, on_epoch=False)  # hack for ckpt monitor
 
         # Tell the data loader processes about the current step.
         if self.step_tracker is not None:
@@ -427,6 +439,9 @@ class ModelWrapper(LightningModule):
                     )
                     camera_poses = stable_poses.unsqueeze(0)
 
+                # [ADDED] request rendered depth from decoder when save_depth is on
+                depth_mode_for_render = "depth" if self.test_cfg.save_depth else None
+
                 if self.test_cfg.render_chunk_size is not None:
                     chunk_size = self.test_cfg.render_chunk_size
                     num_chunks = math.ceil(camera_poses.shape[1] / chunk_size)
@@ -447,16 +462,19 @@ class ModelWrapper(LightningModule):
                             render_near[:, start:end],
                             render_far[:, start:end],
                             (h, w),
-                            depth_mode=None,
+                            depth_mode=depth_mode_for_render,
                         )
 
                         if i == 0:
                             output = curr_output
                         else:
-                            # ignore depth
                             output.color = torch.cat(
                                 (output.color, curr_output.color), dim=1
                             )
+                            if output.depth is not None and curr_output.depth is not None:
+                                output.depth = torch.cat(
+                                    (output.depth, curr_output.depth), dim=1
+                                )
 
                 else:
                     output = self.decoder.forward(
@@ -466,7 +484,7 @@ class ModelWrapper(LightningModule):
                         batch["target"]["near"],
                         batch["target"]["far"],
                         (h, w),
-                        depth_mode=None,
+                        depth_mode=depth_mode_for_render,
                     )
 
         (scene,) = batch["scene"]
@@ -524,6 +542,19 @@ class ModelWrapper(LightningModule):
 
             if self.train_cfg.forward_depth_only:
                 return
+
+            # [ADDED] save rendered depth (target view perspective, from Gaussian splatting decoder)
+            # contrast with encoder depth above: this is alpha-composited depth across Gaussians,
+            # not the per-context-pixel cost-volume depth.
+            if output.depth is not None:
+                rendered_depth = output.depth[0].cpu().detach()  # [V_tgt, H, W]
+                for idx, d in zip(batch["target"]["index"][0], rendered_depth):
+                    d_viz = viz_depth_tensor(d, return_numpy=True)
+                    save_path = path / "images" / scene / "depth_rendered" / f"{idx:0>6}.png"
+                    os.makedirs(os.path.dirname(str(save_path)), exist_ok=True)
+                    Image.fromarray(d_viz).save(save_path)
+                    if self.test_cfg.save_depth_npy:
+                        np.save(str(save_path).replace(".png", ".npy"), d.cpu().numpy())
 
         images_prob = output.color[0]
         rgb_gt = batch["target"]["image"][0]
@@ -1096,6 +1127,29 @@ class ModelWrapper(LightningModule):
             scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 optimizer,
                 [self.optimizer_cfg.lr_monodepth, self.optimizer_cfg.lr],
+                self.trainer.max_steps + 10,
+                pct_start=0.01,
+                cycle_momentum=False,
+                anneal_strategy="cos",
+            )
+
+        # [ADDED] lr_monodepth=0.0 → freeze DINOv2 entirely (per-scene fine-tuning mode).
+        # DINOv2 params are identified by "pretrained" in their name.
+        elif self.optimizer_cfg.lr_monodepth == 0.0:
+            for name, param in self.named_parameters():
+                if "pretrained" in name:
+                    param.requires_grad_(False)
+
+            trainable_params = [p for n, p in self.named_parameters() if "pretrained" not in n]
+            optimizer = optim.AdamW(
+                trainable_params,
+                lr=self.optimizer_cfg.lr,
+                weight_decay=self.optimizer_cfg.weight_decay,
+            )
+
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer,
+                self.optimizer_cfg.lr,
                 self.trainer.max_steps + 10,
                 pct_start=0.01,
                 cycle_momentum=False,

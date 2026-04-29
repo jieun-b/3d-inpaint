@@ -217,6 +217,7 @@ class MultiViewUniMatch(nn.Module):
         # images: [B, V, C, H, W]
         b, v = images.shape[:2]
         concat = rearrange(images, "b v c h w -> (b v) c h w")
+
         # list of [BV, C, H, W], resolution from high to low
         features = self.backbone(concat)
         # reverse: resolution from low to high
@@ -281,6 +282,7 @@ class MultiViewUniMatch(nn.Module):
                 rearrange(features_cnn_pos, "(b v) c h w -> b v c h w", b=b, v=v), dim=1
             )
         )
+
         features_list_mv = self.transformer(
             features_list,
             attn_num_splits=attn_splits,
@@ -382,30 +384,6 @@ class MultiViewUniMatch(nn.Module):
             )  # list of [B, 3, 3]
             extrinsics_curr = list(torch.unbind(extrinsics, dim=1))  # list of [B, 4, 4]
 
-            # ref: [BV, C, H, W], [BV, 3, 3], [BV, 4, 4]
-            # tgt: [BV, V-1, C, H, W], [BV, V-1, 3, 3], [BV, V-1, 4, 4]
-            (
-                ref_features,
-                ref_intrinsics,
-                ref_extrinsics,
-                tgt_features,
-                tgt_intrinsics,
-                tgt_extrinsics,
-            ) = batch_features_camera_parameters(
-                features_mv_curr,
-                intrinsics_curr,
-                extrinsics_curr,
-                nn_matrix=nn_matrix,
-            )
-
-            b_new, _, c, h, w = tgt_features.size()
-
-            # relative pose
-            # extrinsics: c2w
-            pose_curr = torch.matmul(
-                tgt_extrinsics.inverse(), ref_extrinsics.unsqueeze(1)
-            )  # [BV, V-1, 4, 4]
-
             if scale_idx > 0:
                 # 2x upsample depth
                 assert depth is not None
@@ -415,7 +393,10 @@ class MultiViewUniMatch(nn.Module):
 
             num_depth_candidates = self.num_depth_candidates // (4**scale_idx)
 
-            # generate depth candidates
+            # spatial dims at this scale
+            h, w = features_list_mv[scale_idx].shape[-2:]
+
+            # generate depth candidates [BV, D, ...]
             if scale_idx == 0:
                 # min_depth, max_depth: [BV]
                 depth_interval = (max_depth - min_depth) / (
@@ -460,6 +441,29 @@ class MultiViewUniMatch(nn.Module):
                     depth_range_max - depth_range_min
                 )  # [BV, D, H, W]
 
+            # ref: [BV, C, H, W], [BV, 3, 3], [BV, 4, 4]
+            # tgt: [BV, V-1, C, H, W], [BV, V-1, 3, 3], [BV, V-1, 4, 4]
+            (
+                ref_features,
+                ref_intrinsics,
+                ref_extrinsics,
+                tgt_features,
+                tgt_intrinsics,
+                tgt_extrinsics,
+            ) = batch_features_camera_parameters(
+                features_mv_curr,
+                intrinsics_curr,
+                extrinsics_curr,
+                nn_matrix=nn_matrix,
+            )
+
+            b_new, _, c, h, w = tgt_features.size()
+
+            # relative pose: c2w
+            pose_curr = torch.matmul(
+                tgt_extrinsics.inverse(), ref_extrinsics.unsqueeze(1)
+            )  # [BV, V-1, 4, 4]
+
             if scale_idx == 0:
                 # [BV*(V-1), D, H, W]
                 depth_candidates_curr = (
@@ -497,12 +501,13 @@ class MultiViewUniMatch(nn.Module):
                 b=b_new,
                 v=tgt_features.size(1),
             )
-            # [BV, V-1, D, H, W] -> [BV, D, H, W]
-            # average cross other views
-            cost_volume = (
-                (ref_features.unsqueeze(-3).unsqueeze(1) * warped_tgt_features).sum(2)
-                / (c**0.5)
-            ).mean(1)
+            # Chunk over V-1 view dim to avoid materializing [BV, V-1, C, D, H, W].
+            # Loop uses [BV, C, D, H, W] per step instead of the full V-1 expanded tensor.
+            n_tgt = warped_tgt_features.shape[1]
+            cost_volume = sum(
+                (ref_features.unsqueeze(-3) * warped_tgt_features[:, i]).sum(1)
+                for i in range(n_tgt)
+            ) / (c**0.5) / n_tgt
 
             # regressor
             features_cnn = features_list_cnn[scale_idx]  # [BV, C, H, W]
@@ -512,10 +517,7 @@ class MultiViewUniMatch(nn.Module):
             concat = torch.cat(
                 (cost_volume, features_cnn, features_mv, features_mono), dim=1
             )
-
-            out = self.regressor[scale_idx](concat) + self.regressor_residual[
-                scale_idx
-            ](concat)
+            out = self.regressor[scale_idx](concat) + self.regressor_residual[scale_idx](concat)
 
             # depth pred
             match_prob = F.softmax(
@@ -544,7 +546,6 @@ class MultiViewUniMatch(nn.Module):
             if scale_idx == self.num_scales - 1:
                 residual_depth = self.upsampler(
                     mono_intermediate_features,
-                    # resolution high to low
                     cnn_features=features_list_cnn_all_scales[::-1],
                     mv_features=(
                         features_mv if self.num_scales == 1 else features_list_mv[::-1]
