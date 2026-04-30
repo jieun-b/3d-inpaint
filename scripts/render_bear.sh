@@ -1,26 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Render bear scene from a trained checkpoint (16-view context).
-# Runs mode=test: saves RGB images, depth maps, and optional video/PLY.
+# Render bear scene from a fine-tuned checkpoint (16-view context).
+# Runs mode=test: saves RGB images, encoder depth, and rendered depth.
+# Output: outputs/reconstruction/bear_finetuned/
 #
 # Usage:
 #   bash scripts/render_bear.sh <checkpoint> [gpu]
 #
 # Example:
-#   bash scripts/render_bear.sh outputs/finetune/bear_multiview/checkpoints/epoch_1999-step_2000.ckpt 1
+#   bash scripts/render_bear.sh outputs/finetune/bear_multiview/checkpoints/epoch_4999-step_5000.ckpt 0
 
 DEPTHSPLAT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATASET=/home/junho/jieun/3dgic_pixel_aligned_vggt/external/depthsplat/datasets/bear_re10k_like
 
-CKPT=${1:?"Usage: $0 <checkpoint> [gpu=1]"}
-GPU=${2:-1}
+CKPT=${1:?"Usage: $0 <checkpoint> [gpu=0]"}
+GPU=${2:-0}
 
-OUTPUT=${DEPTHSPLAT_DIR}/outputs/render/bear_ctx16
+OUTPUT=${DEPTHSPLAT_DIR}/outputs/reconstruction/bear_finetuned
 
 cd "${DEPTHSPLAT_DIR}"
 
-echo "Rendering bear scene from checkpoint: ${CKPT}"
+echo "Rendering bear scene (fine-tuned) from checkpoint: ${CKPT}"
 echo "Context: 16 views | Output: ${OUTPUT}"
 
 CUDA_VISIBLE_DEVICES=${GPU} \
@@ -66,6 +67,5 @@ python -m src.main \
 echo ""
 echo "Done. Results saved to: ${OUTPUT}"
 echo "  RGB images:     ${OUTPUT}/images/<scene>/color/"
-echo "  Encoder depth:  ${OUTPUT}/images/<scene>/depth/          (per context pixel, cost-volume)"
-echo "  Rendered depth: ${OUTPUT}/images/<scene>/depth_rendered/ (per target pixel, Gaussian alpha-composite)"
+echo "  Encoder depth:  ${OUTPUT}/images/<scene>/depth/          (cost-volume, per context pixel)"
 echo "  Scores:         ${OUTPUT}/metrics/"

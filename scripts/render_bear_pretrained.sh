@@ -1,29 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Multi-view bear scene fine-tuning (16 evenly-spaced context views).
-# Context: 16 views sampled every 6 frames from 96 training frames.
-# Target: random 1 view from all 96 frames each step (3DGS-style supervision).
-# DINOv2 frozen. lr=2e-5 (low lr to preserve pretrained 2-view weights during 16-view adaptation).
+# Render bear scene using the pretrained model only (no fine-tuning).
+# Useful as a quality baseline before/without scene-specific fine-tuning.
+# Output: outputs/reconstruction/bear_pretrained/
+#
+# Usage:
+#   bash scripts/render_bear_pretrained.sh [gpu]
 
 DEPTHSPLAT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATASET=/home/junho/jieun/3dgic_pixel_aligned_vggt/external/depthsplat/datasets/bear_re10k_like
 PRETRAINED=/home/junho/jieun/3dgic_pixel_aligned_vggt/external/depthsplat/pretrained/depthsplat-gs-base-re10k-256x256-view2-ca7b6795.pth
-OUTPUT=${DEPTHSPLAT_DIR}/outputs/finetune/bear_multiview
 
-MAX_STEPS=${1:-5000}
-GPU=${2:-0}
+GPU=${1:-0}
+
+OUTPUT=${DEPTHSPLAT_DIR}/outputs/reconstruction/bear_pretrained
 
 cd "${DEPTHSPLAT_DIR}"
 
-echo "Running multi-view bear fine-tuning for ${MAX_STEPS} steps on GPU ${GPU}..."
-echo "Context: 16 views | Target: random 1 view | DINOv2: frozen"
+echo "Rendering bear scene (pretrained, no fine-tuning)"
+echo "Context: 16 views | Output: ${OUTPUT}"
 
 CUDA_VISIBLE_DEVICES=${GPU} \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 python -m src.main \
   +experiment=re10k \
-  mode=train \
+  mode=test \
   wandb.mode=disabled \
   dataset.roots=["${DATASET}"] \
   dataset.skip_bad_shape=false \
@@ -39,25 +41,28 @@ python -m src.main \
   dataset.image_shape=[256,256] \
   dataset/view_sampler=arbitrary \
   dataset.view_sampler.num_context_views=16 \
-  dataset.view_sampler.num_target_views=1 \
   'dataset.view_sampler.context_views=[0,6,12,18,24,30,36,42,48,54,60,66,72,78,84,90]' \
+  dataset.view_sampler.num_target_views=96 \
+  'dataset.view_sampler.target_views=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95]' \
+  test.render_chunk_size=8 \
   checkpointing.pretrained_model="${PRETRAINED}" \
-  checkpointing.every_n_train_steps=500 \
-  checkpointing.save_top_k=5 \
   model.encoder.num_scales=2 \
   model.encoder.upsample_factor=2 \
   model.encoder.lowest_feature_resolution=4 \
   model.encoder.monodepth_vit_type=vitb \
   model.encoder.local_mv_match=2 \
-  optimizer.lr=2e-5 \
-  optimizer.lr_monodepth=0.0 \
-  train.eval_model_every_n_val=0 \
-  train.print_log_every_n_steps=50 \
-  trainer.max_steps=${MAX_STEPS} \
-  trainer.val_check_interval=null \
-  trainer.num_sanity_val_steps=0 \
-  data_loader.train.batch_size=1 \
-  data_loader.train.num_workers=0 \
-  data_loader.val.num_workers=0 \
+  test.compute_scores=true \
+  test.save_image=true \
+  test.save_gt_image=true \
+  test.save_depth=true \
+  test.save_depth_concat_img=true \
+  test.save_video=false \
+  test.save_gaussian=false \
   data_loader.test.num_workers=0 \
   output_dir="${OUTPUT}"
+
+echo ""
+echo "Done. Results saved to: ${OUTPUT}"
+echo "  RGB images:    ${OUTPUT}/images/<scene>/color/"
+echo "  Encoder depth: ${OUTPUT}/images/<scene>/depth/  (cost-volume, per context pixel)"
+echo "  Scores:        ${OUTPUT}/metrics/"

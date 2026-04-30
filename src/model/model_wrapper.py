@@ -348,7 +348,7 @@ class ModelWrapper(LightningModule):
             mem_gb = torch.cuda.max_memory_allocated() / 1e9
             step_sec = time.time() - step_start
             n_ctx = batch['context']['index'].shape[1]
-            print(
+            log_msg = (
                 f"train step {self.global_step}; "
                 f"scene = {[x[:20] for x in batch['scene']]}; "
                 f"context = {n_ctx} views; "
@@ -357,6 +357,11 @@ class ModelWrapper(LightningModule):
                 f"peak = {mem_gb:.2f} GB; "     # [ADDED] renamed for clarity
                 f"time = {step_sec:.2f}s"
             )
+            print(log_msg, flush=True)
+            train_log = Path(get_cfg()["output_dir"]) / "train_loss.log"
+            train_log.parent.mkdir(parents=True, exist_ok=True)
+            with train_log.open("a") as f:
+                f.write(log_msg + "\n")
         self.log("info/near", batch["context"]["near"].detach().cpu().numpy().mean(), on_epoch=False)
         self.log("info/far", batch["context"]["far"].detach().cpu().numpy().mean(), on_epoch=False)
         self.log("info/global_step", self.global_step, on_epoch=False)  # hack for ckpt monitor
@@ -439,9 +444,6 @@ class ModelWrapper(LightningModule):
                     )
                     camera_poses = stable_poses.unsqueeze(0)
 
-                # [ADDED] request rendered depth from decoder when save_depth is on
-                depth_mode_for_render = "depth" if self.test_cfg.save_depth else None
-
                 if self.test_cfg.render_chunk_size is not None:
                     chunk_size = self.test_cfg.render_chunk_size
                     num_chunks = math.ceil(camera_poses.shape[1] / chunk_size)
@@ -462,7 +464,7 @@ class ModelWrapper(LightningModule):
                             render_near[:, start:end],
                             render_far[:, start:end],
                             (h, w),
-                            depth_mode=depth_mode_for_render,
+                            depth_mode="depth" if self.test_cfg.save_depth else None,
                         )
 
                         if i == 0:
@@ -484,7 +486,7 @@ class ModelWrapper(LightningModule):
                         batch["target"]["near"],
                         batch["target"]["far"],
                         (h, w),
-                        depth_mode=depth_mode_for_render,
+                        depth_mode="depth" if self.test_cfg.save_depth else None,
                     )
 
         (scene,) = batch["scene"]
@@ -543,18 +545,24 @@ class ModelWrapper(LightningModule):
             if self.train_cfg.forward_depth_only:
                 return
 
-            # [ADDED] save rendered depth (target view perspective, from Gaussian splatting decoder)
-            # contrast with encoder depth above: this is alpha-composited depth across Gaussians,
-            # not the per-context-pixel cost-volume depth.
             if output.depth is not None:
-                rendered_depth = output.depth[0].cpu().detach()  # [V_tgt, H, W]
-                for idx, d in zip(batch["target"]["index"][0], rendered_depth):
-                    d_viz = viz_depth_tensor(d, return_numpy=True)
-                    save_path = path / "images" / scene / "depth_rendered" / f"{idx:0>6}.png"
-                    os.makedirs(os.path.dirname(str(save_path)), exist_ok=True)
-                    Image.fromarray(d_viz).save(save_path)
+                rendered_depth = output.depth[0].cpu().detach()
+                for idx, depth_i in zip(batch["target"]["index"][0], rendered_depth):
+                    depth_viz = viz_depth_tensor(depth_i, return_numpy=True)
+                    save_path = (
+                        path / "images" / scene / "depth_rendered" / f"{idx:0>6}.png"
+                    )
+                    save_dir = os.path.dirname(save_path)
+                    os.makedirs(save_dir, exist_ok=True)
+                    Image.fromarray(depth_viz).save(save_path)
+
                     if self.test_cfg.save_depth_npy:
-                        np.save(str(save_path).replace(".png", ".npy"), d.cpu().numpy())
+                        save_path = (
+                            path / "images" / scene / "depth_rendered" / f"{idx:0>6}.npy"
+                        )
+                        save_dir = os.path.dirname(save_path)
+                        os.makedirs(save_dir, exist_ok=True)
+                        np.save(save_path, depth_i.detach().cpu().numpy())
 
         images_prob = output.color[0]
         rgb_gt = batch["target"]["image"][0]

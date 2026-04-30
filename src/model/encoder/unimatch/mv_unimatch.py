@@ -501,8 +501,8 @@ class MultiViewUniMatch(nn.Module):
                 b=b_new,
                 v=tgt_features.size(1),
             )
-            # Chunk over V-1 view dim to avoid materializing [BV, V-1, C, D, H, W].
-            # Loop uses [BV, C, D, H, W] per step instead of the full V-1 expanded tensor.
+            # Reduce over the V-1 view dimension without materializing the full
+            # elementwise-product tensor [BV, V-1, C, D, H, W].
             n_tgt = warped_tgt_features.shape[1]
             cost_volume = sum(
                 (ref_features.unsqueeze(-3) * warped_tgt_features[:, i]).sum(1)
